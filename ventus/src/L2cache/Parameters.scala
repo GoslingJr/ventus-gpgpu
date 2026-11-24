@@ -140,7 +140,8 @@ case class InclusiveCacheParameters_lite(
   cache: CacheParameters,
   micro: InclusiveCacheMicroParameters,
   control: Boolean,
-  mmu: Boolean)
+  mmu: Boolean,
+  carryAtomicTag: Boolean = false)
 {
 
   require (cache.ways > 1)
@@ -157,8 +158,10 @@ case class InclusiveCacheParameters_lite(
   val param_bits = 3
   // the additional 1-bit at LSB is used for specifying TLB/L1Cache
   // automatically removed when L2Cache responsing to L1Cache
-  val source_bits=3+log2Up(micro.NMshrEntry)+log2Up(micro.NSets)+log2Ceil(micro.num_sm_in_cluster)+log2Ceil(micro.num_cluster)+1 +1
-  val source_bits_custom=3+log2Up(micro.NMshrEntry)+log2Up(micro.NSets)+log2Ceil(micro.num_sm_in_cluster)+log2Ceil(micro.num_cluster)+1 +1 +log2Ceil(micro.NInfWriteEntry) + 2
+  private val clientSourceBits = 3 + log2Up(micro.NMshrEntry) + log2Up(micro.NSets) +
+    log2Ceil(micro.num_sm_in_cluster) + log2Ceil(micro.num_cluster) + 2
+  val source_bits_custom = clientSourceBits + log2Ceil(micro.NInfWriteEntry) + 2
+  val source_bits = if (carryAtomicTag) source_bits_custom else clientSourceBits
   val data_bits=(cache.beatBytes)*8
   val mask_bits=cache.beatBytes/micro.writeBytes
   val size_bits=log2Ceil(cache.beatBytes) //todo 设计有问题

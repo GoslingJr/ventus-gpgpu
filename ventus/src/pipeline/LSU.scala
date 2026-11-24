@@ -125,10 +125,12 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
     val idx_entry = Input(UInt(log2Up(lsu_nMshrEntry).W))
     val flush_dcache = Flipped(DecoupledIO(Bool()))
     val flush_dcache_done = Input(Bool())
+    val kernel_flush_done = Output(Bool())
+    val laneResponse = Flipped(Valid(UInt(log2Up(lsu_nMshrEntry).W)))
     val to_dcache = DecoupledIO(new DCacheCoreReq_np)
     val to_shared = DecoupledIO(new ShareMemCoreReq_np)
   })
-  val s_idle :: s_save :: s_shared :: s_dcache ::s_dcache_1::s_dcache_2::s_flush_wait:: Nil = Enum(7)
+  val s_idle :: s_save :: s_shared :: s_dcache :: s_flush_wait :: s_amo_resp :: s_amo_flush :: s_amo_flush_wait :: s_acquire :: s_acquire_wait :: Nil = Enum(10)
   val cnt = new Counter(n = num_thread)
   val state = RegInit(init = s_idle)
 
@@ -152,7 +154,7 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
     val byteLaneOffset = Mux(reg_save.ctrl.mem_whb === MEM_W, 0.U, privateByteOffset(1,0))
     val pdsWordStride = wordBaseOffset * io.csr_numw * io.csr_numt
     val pdsLaneSlot = Cat(io.csr_tid + x.asUInt, 0.U(2.W))
-    addr(x) :=  Mux(reg_save.ctrl.isvec & reg_save.ctrl.disable_mask,
+    val ordinaryAddr = Mux(reg_save.ctrl.isvec & reg_save.ctrl.disable_mask,
                   Mux(reg_save.ctrl.is_vls12,
                     reg_save.in1(x)+reg_save.in2(x),
                     byteLaneOffset + pdsLaneSlot + io.csr_pds + pdsWordStride
@@ -167,6 +169,7 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
                     reg_save.in1(0) + reg_save.in2(0)
                   )
                 )
+    addr(x) := Mux(reg_save.ctrl.atomic, reg_save.in1(x), ordinaryAddr)
     is_shared(x) := !reg_save.mask(x) || ( addr(x) >= LDS_BASE.U(32.W) && addr(x) < (LDS_BASE.U(32.W) + sharedmemory_maxsize) )
   })
   all_shared := Mux(reg_save.ctrl.isvec,
@@ -213,13 +216,13 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
   io.to_mshr.bits.tag.unsigned := reg_save.ctrl.mem_unsigned
   io.to_mshr.bits.tag.wordOffset1H := wordOffset1H
   io.to_mshr.valid := state===s_save & (reg_save.ctrl.mem_cmd.orR)
-  io.to_mshr.bits.tag.isWrite := reg_save.ctrl.mem_cmd(1)
+  io.to_mshr.bits.tag.isWrite := reg_save.ctrl.mem_cmd(1) && !reg_save.ctrl.atomic
   if(SPIKE_OUTPUT){
     io.to_mshr.bits.tag.spike_info.get:=reg_save.ctrl.spike_info.get
   }
   //val reg_toShared = Reg(new toShared)
   //val vld_toShared = Reg(Bool())
-  val data_next=reg_save.in3
+  val data_next = Mux(reg_save.ctrl.atomic, reg_save.in2, reg_save.in3)
 
   io.to_shared.bits.instrId := reg_entryID
   // |reg_save| -> |addr & mask| -> |PriorityEncoder| -> |tag & idx| -> |io.to_dcache.bits|
@@ -253,20 +256,16 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
     Mux(reg_save.ctrl.alu_fn===FN_AND,3.U,Mux(reg_save.ctrl.alu_fn===FN_OR,2.U,Mux(reg_save.ctrl.alu_fn===FN_MIN,4.U,
     Mux(reg_save.ctrl.alu_fn===FN_MAX,5.U,Mux(reg_save.ctrl.alu_fn===FN_MINU,6.U,Mux(reg_save.ctrl.alu_fn===FN_MAXU,7.U,1.U)))))))))
   val param_wire=Wire(UInt(4.W))
-  when(reg_save.ctrl.atomic){
-    when(reg_save.ctrl.aq &&reg_save.ctrl.rl){
-      opcode_wire :=Mux(state===s_dcache_2,3.U,Mux(state===s_dcache_1,2.U,3.U))
-      param_wire :=Mux(state===s_dcache_2,0.U,Mux(state===s_dcache_1,param_wire_alt,0.U))
-    }.elsewhen(reg_save.ctrl.aq){
-      opcode_wire :=Mux(state===s_dcache_1,2.U,3.U)
-      param_wire :=Mux(state===s_dcache_1,param_wire_alt,0.U)
-    }.elsewhen(reg_save.ctrl.rl){
-      opcode_wire :=Mux(state===s_dcache_1,3.U,2.U)
-      param_wire :=Mux(state===s_dcache_1,0.U,param_wire_alt)
-    }.otherwise{
-      opcode_wire := Mux(reg_save.ctrl.alu_fn===FN_ADD,reg_save.ctrl.mem_cmd(1),2.U) //todo should consider lr/sc
-      param_wire :=param_wire_alt
-    }
+  // L2 performs the RMW. Write back dirty L1 data before the first lane,
+  // including for relaxed AMOs. Acquire also invalidates L1 after the last lane.
+  val amoFence = state === s_amo_flush || state === s_acquire
+  io.kernel_flush_done := io.flush_dcache_done && (is_flush || state === s_flush_wait)
+  when(amoFence) {
+    opcode_wire := 3.U
+    param_wire := Mux(state === s_amo_flush, 4.U, 3.U)
+  }.elsewhen(reg_save.ctrl.atomic) {
+    opcode_wire := 2.U
+    param_wire := param_wire_alt
   }.elsewhen(reg_save.ctrl.fence){
     opcode_wire :=3.U
     param_wire :=0.U
@@ -279,19 +278,19 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
   }
   io.to_dcache.bits.opcode :=opcode_wire// fence=invalidate, atomic will split to maximum 3 instructions
   io.to_dcache.bits.param :=param_wire
-  io.to_dcache.bits.isKernelFlush := is_flush
+  io.to_dcache.bits.isKernelFlush := is_flush || amoFence
 
   (0 until num_thread).foreach(x => {
     io.to_dcache.bits.perLaneAddr(x).blockOffset := blockOffset(x)
     io.to_dcache.bits.perLaneAddr(x).wordOffset1H := wordOffset1H(x)
-    io.to_dcache.bits.perLaneAddr(x).activeMask := Mux(reg_save.ctrl.atomic,reg_save.mask(x)&& (x.asUInt===PriorityEncoder(reg_save.mask.asUInt)),
+    io.to_dcache.bits.perLaneAddr(x).activeMask := Mux(reg_save.ctrl.atomic,!amoFence && reg_save.mask(x)&& (x.asUInt===PriorityEncoder(reg_save.mask.asUInt)),
       reg_save.mask(x) && (addr(x)(xLen-1, xLen-1-dcache_TagBits+1)===tag && addr(x)(xLen-1-dcache_TagBits, xLen-1-dcache_TagBits-dcache_SetIdxBits+1)===setIdx)
     )
 
   })
   io.to_dcache.bits.data := data_next//Mux(reg_save.ctrl.mem_cmd(0).asBool, VecInit(Seq.fill(num_thread)(0.U(xLen.W))), reg_save.in3)
  // io.to_dcache.bits.isWrite := reg_save.ctrl.mem_cmd(1)
-  io.to_dcache.valid := (state===s_dcache) ||(state===s_dcache_1) ||(state===s_dcache_2)
+  io.to_dcache.valid := state === s_dcache || amoFence
   val mask_next = Wire(Vec(num_thread, Bool()))
 
   (0 until num_thread).foreach( x => {                          // update mask
@@ -310,7 +309,12 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
     }
     is (s_save){
       when(reg_save.ctrl.mem_cmd.orR){ // read or write
-        when(all_shared && !is_flush){ // shared memory
+        when(reg_save.ctrl.atomic && !is_flush) {
+          when(io.to_mshr.fire) {
+            assert(!(reg_save.mask.asUInt & is_shared.asUInt).orR, "shared-memory AMOs are unsupported")
+            state := Mux(reg_save.mask.asUInt.orR, s_amo_flush, s_idle)
+          }
+        }.elsewhen(all_shared && !is_flush){ // shared memory
           when(io.to_mshr.fire){state := s_shared}.otherwise{state := s_save}
         }.otherwise{ // dcache
             when(io.to_mshr.fire) {
@@ -339,8 +343,8 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
         }
       }.otherwise {
         when(io.to_dcache.fire) {
-          when((reg_save.ctrl.atomic && reg_save.ctrl.aq) || (reg_save.ctrl.atomic && reg_save.ctrl.rl)) {
-            state := s_dcache_1
+          when(reg_save.ctrl.atomic) {
+            state := s_amo_resp
           }.elsewhen(cnt.value >= num_thread.U || mask_next.asUInt === 0.U) {
             cnt.reset();
             state := s_idle
@@ -353,29 +357,19 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
         }
       }
     }
-    is(s_dcache_1){
-      when(io.to_dcache.fire){
-
-          when(reg_save.ctrl.aq && reg_save.ctrl.rl) {
-            state := s_dcache_2
-          }.elsewhen(cnt.value>=num_thread.U || mask_next.asUInt===0.U){
-            cnt.reset(); state := s_idle
-        }.otherwise{
-            cnt.inc(); state :=s_dcache
-        }
-      }.otherwise{
-        state :=s_dcache_1
+    is(s_amo_resp) {
+      when(io.laneResponse.valid && io.laneResponse.bits === reg_entryID) {
+        state := Mux(reg_save.mask.asUInt.orR, s_dcache, Mux(reg_save.ctrl.aq, s_acquire, s_idle))
       }
     }
-    is(s_dcache_2){
-      when(io.to_dcache.fire){
-        when(cnt.value>=num_thread.U ||mask_next.asUInt===0.U){
-          cnt.reset();state:=s_idle
-        }.otherwise{
-          cnt.inc(); state := s_dcache
-        }
-      }.otherwise{state := s_dcache_2}
+    is(s_amo_flush) {
+      when(io.to_dcache.fire) { state := Mux(io.flush_dcache_done, s_dcache, s_amo_flush_wait) }
     }
+    is(s_amo_flush_wait) { when(io.flush_dcache_done) { state := s_dcache } }
+    is(s_acquire) {
+      when(io.to_dcache.fire) { state := Mux(io.flush_dcache_done, s_idle, s_acquire_wait) }
+    }
+    is(s_acquire_wait) { when(io.flush_dcache_done) { state := s_idle } }
   }
   // FSM Operation
   switch(state){
@@ -385,11 +379,6 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
         reg_save.ctrl.mem_cmd := 1.U
       }.elsewhen(io.from_fifo.fire){ // Next: s_save
         reg_save := io.from_fifo.bits   // save data
-        when(io.from_fifo.bits.ctrl.atomic){
-          reg_save.ctrl.aq := true.B
-        }.otherwise{
-          reg_save.ctrl.aq:=io.from_fifo.bits.ctrl.aq
-        }
         reg_save.mask := Mux(io.from_fifo.bits.ctrl.isvec, io.from_fifo.bits.mask, VecInit((1.U(num_thread.W)).asBools))
       }.otherwise{reg_save := RegInit(0.U.asTypeOf(new vExeData))}
     }
@@ -454,7 +443,7 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
       } .elsewhen(reg_save.ctrl.mem_cmd === IDecode.M_XWR) {
         val idx = Mux(reg_save.ctrl.disable_mask, reg_save.ctrl.reg_idx2, reg_save.ctrl.reg_idxw)
         // store 把 data 与 addr 同 lane 配对："[lN]=DATA@ADDR"
-        val store_print: Printable = reg_save.in3.zip(addr).zipWithIndex.reverse.map { case ((d, a), i) =>
+        val store_print: Printable = data_next.zip(addr).zipWithIndex.reverse.map { case ((d, a), i) =>
           p" [l${i}]=${Hexadecimal(d)}@${Hexadecimal(a)}"
         }.reduceOption(_ + _).getOrElse(p"")
         printf(common_prefix + p"lsu.w v${idx} op ${reg_save.ctrl.mop} mask ${Binary(reg_save.mask.asUInt)}" + store_print + p"\n")
@@ -561,6 +550,7 @@ class LSUexe() extends Module{
     val fence_end = Output(UInt(num_warp.W))
     val flush_dcache = Flipped(DecoupledIO(Bool()))
     val flush_dcache_done = Input(Bool())
+    val kernel_flush_done = Output(Bool())
 
     val csr_wid = Output(UInt(depth_warp.W))
     val csr_pds = Input(UInt(xLen.W))
@@ -580,6 +570,9 @@ class LSUexe() extends Module{
   io.shared_req <> AddrCalc.io.to_shared
   io.flush_dcache <> AddrCalc.io.flush_dcache
   AddrCalc.io.flush_dcache_done := io.flush_dcache_done
+  io.kernel_flush_done := AddrCalc.io.kernel_flush_done
+  AddrCalc.io.laneResponse.valid := io.dcache_rsp.fire && io.dcache_rsp.bits.activeMask.asUInt.orR
+  AddrCalc.io.laneResponse.bits := io.dcache_rsp.bits.instrId
 
   val rspArbiter = Module(new Arbiter(new DCacheCoreRsp_np, n = 2))
   rspArbiter.io.in(1) <> io.shared_rsp

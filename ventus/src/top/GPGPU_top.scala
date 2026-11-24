@@ -200,7 +200,10 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
   val sm_wrapper_inst = Seq.tabulate(NSms) { i => Instantiate(new SM_wrapper(FakeCache, SV)) }
   sm_wrapper_inst.zipWithIndex.foreach{ case (inst, i) => inst.sm_id := i.U }
   val sm_wrapper = VecInit.tabulate(NSms)(i => sm_wrapper_inst(i).io)
-  val l2cache=VecInit(Seq.fill(NL2Cache)( Module(new Scheduler(l2cache_params)).io))
+  // In the physical-address path the ATU prefixes the client source. The L2
+  // directory, MSHRs and response queue must all retain that prefix.
+  val bankParams = l2cache_params.copy(carryAtomicTag = !MMU_ENABLED)
+  val l2cache = VecInit(Seq.fill(NL2Cache)(Module(new Scheduler(bankParams)).io))
   val sm2clusterArb = VecInit(Seq.fill(NCluster)(Module(new SM2clusterArbiter(l2cache_params_l)).io))
   val l2distribute = VecInit(Seq.fill(NCluster)(Module(new l2Distribute(l2cache_params_l)).io))
   val cluster2l2Arb = VecInit(Seq.fill(NL2Cache)(Module(new cluster2L2Arbiter(l2cache_params_l,l2cache_params)).io))
@@ -241,6 +244,8 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
         atomicunit(i).L12ATUmemReq.bits := cluster2l2Arb(i).memReqOut.bits
         atomicunit(i).L12ATUmemReq.valid := cluster2l2Arb(i).memReqOut.valid
         cluster2l2Arb(i).memReqOut.ready := atomicunit(i).L12ATUmemReq.ready
+        require(l2cache(i).in_a.bits.source.getWidth == atomicunit(i).ATU2L2memReq.bits.source.getWidth)
+        require(l2cache(i).in_d.bits.source.getWidth == atomicunit(i).L22ATUmemRsp.bits.source.getWidth)
         l2cache(i).in_a <> atomicunit(i).ATU2L2memReq
         cluster2l2Arb(i).memRspIn <> atomicunit(i).ATU2L1memRsp
         atomicunit(i).L22ATUmemRsp.bits := l2cache(i).in_d.bits

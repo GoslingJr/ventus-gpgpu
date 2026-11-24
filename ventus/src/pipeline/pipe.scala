@@ -191,7 +191,7 @@ class pipe() extends Module{
   warp_sche.io.warpReq<>io.warpReq
   warp_sche.io.warpRsp<>io.warpRsp
   warp_sche.io.flushDCache <> lsu.io.flush_dcache
-  warp_sche.io.flushDCacheDone := io.dcache_flush_done
+  warp_sche.io.flushDCacheDone := lsu.io.kernel_flush_done
   lsu.io.flush_dcache_done := io.dcache_flush_done
 
   //flush:=(warp_sche.io.branch.fire&warp_sche.io.branch.bits.jump) | ()

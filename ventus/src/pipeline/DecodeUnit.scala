@@ -453,18 +453,16 @@ object IDecodeLUT_VL{
 }
 object IDecodeLUT_A{ //The last element of the list indicates whether the instruction is atomic.
   import IDecode._
-  val table= Array(
-    LR_W -> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_X,A1_RS1,IMM_X,MEM_W,FN_ADD,N,M_XRD,N,N,N,N,N,N,Y,N,N,N,Y),
-    SC_W ->     List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_ADD,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOSWAP_W-> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_SWAP,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOADD_W -> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_AMOADD,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOXOR_W-> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_XOR,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOAND_W-> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_AND,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOOR_W -> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_OR,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOMIN_W -> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_MIN,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOMAX_W ->List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_MAX,N,M_XWR,N,N,N,N,N,N,Y,N,N,N,Y),
-    AMOMINU_W -> List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_MINU,N,M_XWR,Y,N,N,N,N,N,Y,N,N,N,Y),
-    AMOMAXU_W ->List(N,N,N,B_N,N,N,CSR.N,N,A3_X,A2_RS2,A1_RS1,IMM_X,MEM_W,FN_MAXU,N,M_XWR,Y,N,N,N,N,N,Y,N,N,N,Y)
+  // Ventus OpenCL word AMOs use vector rs1, rs2 and rd with the SIMT execution mask.
+  // The aq/rl bits are ordering flags, including when rd is v0.
+  private def wordAmo(fn: UInt) =
+    List(Y,N,N,B_N,N,N,CSR.N,N,A3_X,A2_VRS2,A1_VRS1,IMM_X,MEM_W,fn,N,M_XWR,N,N,N,Y,N,N,N,N,Y,N,Y)
+  val table = Array(
+    AMOADD_W  -> wordAmo(FN_AMOADD), AMOSWAP_W -> wordAmo(FN_SWAP),
+    AMOXOR_W  -> wordAmo(FN_XOR),    AMOAND_W  -> wordAmo(FN_AND),
+    AMOOR_W   -> wordAmo(FN_OR),     AMOMIN_W  -> wordAmo(FN_MIN),
+    AMOMAX_W  -> wordAmo(FN_MAX),    AMOMINU_W -> wordAmo(FN_MINU),
+    AMOMAXU_W -> wordAmo(FN_MAXU)
   )
 }
 object IDecodeLUT_VC{
@@ -556,7 +554,7 @@ class InstrDecodeV2 extends Module {
   }
 
   val ctrlSignals = (0 until num_fetch).map( i => {
-    val lut = Seq(IDecodeLUT_IMF.table, IDecodeLUT_V.table, IDecodeLUT_VL.table, IDecodeLUT_VC.table).map { t =>
+    val lut = Seq(IDecodeLUT_IMF.table, IDecodeLUT_V.table, IDecodeLUT_VL.table, IDecodeLUT_VC.table, IDecodeLUT_A.table).map { t =>
       ListLookup(io.inst(i), IDecode.default, t)
     }
     ListLookup(io.inst(i)(6, 0), lut(0),
@@ -567,7 +565,8 @@ class InstrDecodeV2 extends Module {
         BitPat("b0?00111") -> lut(2),
         BitPat("b0101011") -> lut(2),
         BitPat("b1011011") -> lut(3),
-        BitPat("b0001011") -> lut(3)
+        BitPat("b0001011") -> lut(3),
+        BitPat("b0101111") -> lut(4)
       ))
   })
   (ctrlSignals zip io.control).zipWithIndex.foreach{ case((s, c), i) =>

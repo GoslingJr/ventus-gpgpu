@@ -125,3 +125,37 @@ When running OpenCL programs with the [full toolchain](https://github.com/THU-DS
 * These must be referenced in the correct order in `ventus_args.txt`.
 
 🔑 Reminder: It is recommended to use the **full toolchain** to run new test cases instead of relying on `.metadata`/`.data` directly.
+
+## Testing global word atomics
+
+The cache-enabled, physical-address RTL supports per-lane 32-bit add, swap,
+and, or, xor, signed min/max and unsigned min/max on global memory. The L2
+bank serializes each read-modify-write and returns the previous word. A warp
+writes back dirty L1 data before issuing its first active lane. Acquire
+operations also invalidate L1 after the final lane. Shared-memory atomics,
+LR/SC and compare-exchange are outside the scope of this implementation.
+
+Run the following from the repository root with the matching ventus-env
+environment loaded. This branch was developed with ventus-env at
+`a3939a7` and ventus-gpgpu at `a17507d`. The temporary library directory
+selects the rebuilt RTL for the cache-enabled driver.
+
+```sh
+./mill --no-server 'ventus[6.4.0].tests.testOnly' play.cache.AtomicUnitTest
+make -C sim-verilator lib RELEASE=1 TRACE=0 VLIB_NPROC_SIM=1
+model=$(realpath sim-verilator/build/libVentusRTL/libVentusRTL.so)
+work=$(mktemp -d)
+ln -s "$model" "$work/libVentusRTL-withcache.so"
+cc -std=c11 -O2 -I"$VENTUS_INSTALL_PREFIX/include" \
+    sim-verilator/tests/opencl_global_amo.c -L"$VENTUS_INSTALL_PREFIX/lib" \
+    -lOpenCL -o "$work/opencl_global_amo"
+(
+    cd "$work"
+    LD_LIBRARY_PATH="$work:$LD_LIBRARY_PATH" VENTUS_BACKEND=rtlsim \
+        POCL_CACHE_DIR="$work/pocl-cache" ./opencl_global_amo
+)
+```
+
+The OpenCL test checks contended counters, the value returned to each active
+lane, inactive lanes, all nine operations, and a relaxed atomic between a
+cached store and a load. Success prints `Global word AMOs passed`.

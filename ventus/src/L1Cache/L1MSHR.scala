@@ -503,7 +503,7 @@ class SpecialMSHR(val bABits: Int, val tIWidth: Int, val InstrIdBits: Int, val N
       when(iofEn.asUInt === entryStatus.io.next  && io.missReq.fire && io.missReq.bits.Type =/= 0.U) {
         entry_valid(iofEn) := true.B
       }.elsewhen(iofEn.asUInt === entryMatchMissRsp  &&
-        io.missRspIn.valid && missRspOut_st1.io.enq.ready) {
+        io.missRspIn.fire) {
         entry_valid(iofEn) := false.B
       }
     }//order of when & elsewhen matters, as elsewhen cover some cases of when, but no op to them

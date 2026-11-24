@@ -108,7 +108,10 @@ class MemRspPipe(implicit p: Parameters) extends DCacheModule{
     io.tAAllocateWriteReq.bits.setIdx := io.memRsp.bits.d_source(SetIdxBits-1,0)
     io.MSHRMissRsp.valid := io.memRsp.valid && memRspisRead
     io.MSHRMissRsp.bits.instrId := idx_st0
-    io.SMSHRMissRsp.valid := io.memRsp.valid && memRspisSpecial
+    // Enqueue special metadata and data together. Use the registered empty bit
+    // to keep the core response ready path out of the SMSHR probe logic.
+    val specialSlotFree = !MemRsp_pipeReg_st0_st1.deq.valid
+    io.SMSHRMissRsp.valid := io.memRsp.valid && memRspisSpecial && specialSlotFree
     io.SMSHRMissRsp.bits.instrId := idx_st0
 
     io.RTABUpdateReq.bits.mshrIdx := idx_st0
@@ -132,7 +135,7 @@ class MemRspPipe(implicit p: Parameters) extends DCacheModule{
     }.elsewhen(memRspisWrite){
         st0_ready := true.B
     }.elsewhen(memRspisSpecial){
-        st0_ready := io.SMSHRMissRsp.ready && MemRsp_pipeReg_st0_st1.enq.ready
+        st0_ready := io.SMSHRMissRsp.ready && specialSlotFree
     }.elsewhen(memRspisRead){
         st0_ready := io.MSHRMissRsp.ready && MemRsp_pipeReg_st0_st1.enq.ready
     }
@@ -149,7 +152,7 @@ class MemRspPipe(implicit p: Parameters) extends DCacheModule{
            st0_valid := io.memRsp.valid
        }
     }
-    val memRspMetaReady_st0 = Mux(memRspisSpecial, io.SMSHRMissRsp.ready, io.MSHRMissRsp.ready)
+    val memRspMetaReady_st0 = Mux(memRspisSpecial, io.SMSHRMissRsp.ready && specialSlotFree, io.MSHRMissRsp.ready)
     MemRsp_pipeReg_st0_st1.enq.valid := st0_valid && memRspMetaReady_st0
     MemRsp_pipeReg_st0_st1.enq.bits.Rsp := io.memRsp.bits
     MemRsp_pipeReg_st0_st1.enq.bits.isRead := memRspisRead
@@ -284,7 +287,7 @@ class MemRspPipe(implicit p: Parameters) extends DCacheModule{
         }
     }
     io.MSHRMissRspOut.ready := io.memRsp_coreRsp.ready
-    io.SMSHRMissRspOut.ready := io.memRsp_coreRsp.ready
+    io.SMSHRMissRspOut.ready := io.memRsp_coreRsp.ready && memRsp_st1_isSpecial
     when(tagRequestStatus_next === dAread && st1_valid){
         needReplace_pending := false.B
     }.elsewhen(needReplace_pulse){

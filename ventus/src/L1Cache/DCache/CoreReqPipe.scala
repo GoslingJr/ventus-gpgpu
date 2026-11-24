@@ -689,7 +689,7 @@ class CoreReqPipe(implicit p: Parameters) extends DCacheModule{
 ).reduce(_ | _)
   io.Probe_SMSHR.bits.Type := 0.U
   // todo add probe type
-  io.Probe_SMSHR.valid := CoreReq_pipeReg_st0_st1.deq.valid && !Req_RTAB_st1_valid
+  io.Probe_SMSHR.valid := CoreReq_pipeReg_st0_st1.deq.valid && AMO_LR_SC_st1 && !Req_RTAB_st1_valid
   when(Control_st1.isAMO){
     io.Probe_SMSHR.bits.Type := 3.U
   }.elsewhen(Control_st1.isLR){
